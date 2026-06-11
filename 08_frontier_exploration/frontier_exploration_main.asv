@@ -1,0 +1,645 @@
+% =========================================================================
+%  MODULE 08 — FRONTIER-BASED AUTONOMOUS EXPLORATION
+%  2D LiDAR SLAM Series  |  Froststar16
+% =========================================================================
+%
+%  The robot starts in an unmapped environment and autonomously explores it
+%  by navigating to frontiers — the boundaries between known-free and
+%  unknown space.
+%
+%  Pipeline each step:
+%    1. Move robot (unicycle) + add process noise
+%    2. Simulate 2D LiDAR scan
+%    3. Update EKF SLAM (pose + landmarks)
+%    4. Update occupancy grid
+%    5. Every FRONTIER_INTERVAL steps:
+%         a. Detect + cluster frontier cells
+%         b. Score each frontier: score = size / distance   (hybrid)
+%         c. Navigate to best frontier via A* + pure pursuit
+%    6. Terminate when no frontiers remain OR step budget exhausted
+%
+%  Dependencies (all in this folder):
+%    frontier_detector.m    – frontier detection + clustering
+%    astar_planner.m        – 8-connected A* path planner
+%    pure_pursuit.m         – pure-pursuit path tracker
+%    save_exploration_gif.m – R2024a-compatible GIF export
+%
+% =========================================================================
+
+clear; close all; clc;
+rng(42);
+
+%% ── PARAMETERS ───────────────────────────────────────────────────────────
+
+% Simulation
+DT            = 0.1;       % time step (s)
+MAX_STEPS     = 25000;     % step budget (termination condition 1)
+V_ROBOT       = 0.22;      % nominal forward speed (m/s)
+
+% EKF SLAM
+Q_SIG_V       = 0.02;      % process noise: linear velocity std (m/s)
+Q_SIG_W       = 0.03;      % process noise: angular velocity std (rad/s)
+R_RANGE       = 0.08;      % measurement noise: range std (m)
+R_BEARING     = 0.03;      % measurement noise: bearing std (rad)
+ASSOC_TH      = 1.5;       % Mahalanobis distance threshold for data assoc.
+MAX_LM        = 500;       % max landmarks tracked (needs to be high for 20x20m maze)
+
+% LiDAR
+LIDAR_RANGE   = 5.0;       % max range (m)
+LIDAR_NBEAMS  = 60;        % number of beams
+LIDAR_NOISE   = 0.05;      % range noise std (m)
+
+% Occupancy grid
+GRID_RES      = 0.15;      % metres per cell
+GRID_SIZE     = 20.0;      % world extent (metres), square
+GRID_ORIGIN   = [0, 0];    % world coords of grid bottom-left corner
+LO_FREE       = -0.4;      % log-odds decrement (free)
+LO_OCC        = 1.2;       % log-odds increment (occupied)
+LO_MIN        = -5;
+LO_MAX        = 5;
+OCC_TH        = 0.6;       % log-odds above this → occupied for planner
+INFLATE_R     = 2;         % obstacle inflation radius (cells)
+
+% Frontier exploration
+FRONTIER_INTERVAL = 40;    % recompute frontiers every N steps
+MIN_FRONTIER_SIZE = 3;     % ignore tiny fragments (cells)
+SCORE_DIST_MIN    = 0.5;   % floor on distance to avoid /0 (m)
+GOAL_THRESH       = 0.50;  % distance to count as "reached goal" (m)
+REPLAN_EVERY      = 20;    % check path validity every N steps
+STUCK_LIMIT       = 80;    % steps without progress → pick new frontier
+BLACKLIST_RADIUS  = 3;     % grid cells — blacklist zone around failed target
+BLACKLIST_TTL     = 500;   % steps before a blacklisted cell expires
+
+% Pure pursuit
+LOOKAHEAD         = 0.45;  % lookahead distance (m)
+
+% Visualisation
+VIS_EVERY         = 5;     % redraw every N steps
+GIF_EVERY         = 10;    % save GIF frame every N steps
+GIF_ENABLED       = true;  % set false to skip GIF export
+GIF_FILE          = 'exploration.gif';
+GIF_DELAY         = 0.08;
+
+%% ── WORLD DEFINITION ─────────────────────────────────────────────────────
+WALLS = [
+    % outer boundary
+     0,  0, 20,  0;
+    20,  0, 20, 20;
+    20, 20,  0, 20;
+     0, 20,  0,  0;
+    % internal walls (maze-like rooms)
+     5,  0,  5,  8;
+     5,  9,  5, 14;
+     5, 15,  5, 20;
+    10,  6, 10, 20;
+    10,  0, 10,  4;
+    15,  0, 15,  6;
+    15,  8, 15, 13;
+    15, 15, 15, 20;
+     5, 14, 10, 14;
+    10,  4, 15,  4;
+    15,  6, 20,  6;
+    15, 13, 20, 13;
+];
+
+%% ── GRID SETUP ───────────────────────────────────────────────────────────
+NC_grid = round(GRID_SIZE / GRID_RES);
+NR_grid = NC_grid;
+
+log_odds = zeros(NR_grid, NC_grid);  % 0 = unknown
+
+%% ── COORDINATE CONVERSION (inlined everywhere — no nested functions) ─────
+%
+%   world → grid:
+%     c = floor((wx - GRID_ORIGIN(1)) / GRID_RES) + 1
+%     r = NR_grid - floor((wy - GRID_ORIGIN(2)) / GRID_RES)
+%     clamp r to [1,NR_grid], c to [1,NC_grid]
+%
+%   grid → world (cell centre):
+%     wx = GRID_ORIGIN(1) + (c - 0.5) * GRID_RES
+%     wy = GRID_ORIGIN(2) + (NR_grid - r + 0.5) * GRID_RES
+
+%% ── ROBOT INITIAL STATE ──────────────────────────────────────────────────
+x0 = 2.5;  y0 = 2.5;  th0 = pi/4;
+
+%% ── EKF STATE ────────────────────────────────────────────────────────────
+mu   = [x0; y0; th0];
+P    = diag([0.01 0.01 0.005]);
+n_lm = 0;
+
+%% ── LIDAR BEAM ANGLES ────────────────────────────────────────────────────
+beam_angles = linspace(-pi, pi, LIDAR_NBEAMS + 1);
+beam_angles(end) = [];
+
+%% ── FIGURE SETUP ─────────────────────────────────────────────────────────
+fig = figure('Name', 'Module 08 — Frontier Exploration', ...
+             'Position', [60 60 850 800], 'Color', 'k');
+
+ax = axes('Parent', fig, 'Color', 'k');
+axis(ax, 'equal');
+axis(ax, [0 GRID_SIZE 0 GRID_SIZE]);
+xlabel(ax, 'x (m)', 'Color', 'w');
+ylabel(ax, 'y (m)', 'Color', 'w');
+title(ax, 'Frontier Exploration — building map...', 'Color', 'w', 'FontSize', 11);
+ax.XColor = 'w';  ax.YColor = 'w';
+hold(ax, 'on');
+
+h_grid = imagesc(ax, [GRID_RES/2, GRID_SIZE - GRID_RES/2], ...
+                     [GRID_RES/2, GRID_SIZE - GRID_RES/2], ...
+                     zeros(NR_grid, NC_grid));
+colormap(ax, gray);  caxis(ax, [-1 1]);
+set(ax, 'YDir', 'normal');
+
+for w = 1:size(WALLS, 1)
+    plot(ax, WALLS(w,[1 3]), WALLS(w,[2 4]), 'c-', 'LineWidth', 1.2);
+end
+
+h_trail  = plot(ax, x0, y0, '-', 'Color', [1 0.6 0], 'LineWidth', 1.0);
+trail_x  = x0;
+trail_y  = y0;
+
+h_robot  = plot(ax, x0, y0, 'wo', 'MarkerFaceColor', 'w', ...
+                'MarkerSize', 8, 'LineWidth', 1.5);
+
+h_path   = plot(ax, NaN, NaN, '--', 'Color', [0.4 0.8 0.4], 'LineWidth', 1.2);
+
+h_fronts = plot(ax, NaN, NaN, 'd', 'Color', 'c', ...
+                'MarkerFaceColor', 'none', 'MarkerSize', 8, 'LineWidth', 1.5);
+
+h_target = plot(ax, NaN, NaN, 'p', 'Color', 'm', ...
+                'MarkerFaceColor', 'm', 'MarkerSize', 14);
+
+h_cov  = text(ax, 0.5,  19.3, 'Coverage: 0.0%', 'Color', 'y', ...
+              'FontSize', 10, 'FontWeight', 'bold');
+h_step = text(ax, 10.0, 19.3, 'Step: 0', 'Color', [0.7 0.7 0.7], ...
+              'FontSize', 9, 'HorizontalAlignment', 'center');
+
+drawnow;
+
+%% ── EXPLORATION STATE ────────────────────────────────────────────────────
+x  = x0;  y  = y0;  th = th0;
+
+current_path      = [];
+path_step_idx     = 1;
+target_world      = [];
+steps_no_prog     = 0;
+last_dist_to_goal = inf;
+frontiers         = struct('centroid_w', {}, 'centroid_rc', {}, 'size', {});
+
+gif_frame_idx    = 1;
+exploration_done = false;
+stop_reason      = '';
+
+% blacklist: Nx3 array of [grid_r, grid_c, expiry_step]
+% frontiers whose centroid lands within BLACKLIST_RADIUS of a blacklisted
+% cell get a score of 0 so they're never selected
+frontier_blacklist = zeros(0, 3);
+
+%% ── MAIN LOOP ─────────────────────────────────────────────────────────────
+for step = 1:MAX_STEPS
+
+    % ── 1. MOTION ────────────────────────────────────────────────────────
+    if ~isempty(current_path) && path_step_idx <= size(current_path,1)
+        remaining = current_path(path_step_idx:end, :);
+        [x, y, th] = pure_pursuit(x, y, th, remaining, LOOKAHEAD, V_ROBOT, DT);
+
+        while path_step_idx < size(current_path,1)
+            if norm([x,y] - current_path(path_step_idx,:)) < GRID_RES * 0.8
+                path_step_idx = path_step_idx + 1;
+            else
+                break;
+            end
+        end
+    else
+        th = th + 0.05;
+        x  = x  + 0.01 * cos(th);
+        y  = y  + 0.01 * sin(th);
+    end
+
+    x  = x  + Q_SIG_V * randn * DT;
+    y  = y  + Q_SIG_V * randn * DT;
+    th = th + Q_SIG_W * randn * DT;
+    th = atan2(sin(th), cos(th));
+
+    x = max(0.3, min(GRID_SIZE - 0.3, x));
+    y = max(0.3, min(GRID_SIZE - 0.3, y));
+
+    % ── 2. EKF SLAM PREDICT ──────────────────────────────────────────────
+    vn = V_ROBOT + Q_SIG_V * randn;
+    wn = (th - mu(3)) / DT + Q_SIG_W * randn;
+
+    mu(1) = mu(1) + vn * cos(mu(3)) * DT;
+    mu(2) = mu(2) + vn * sin(mu(3)) * DT;
+    mu(3) = mu(3) + wn * DT;
+    mu(3) = atan2(sin(mu(3)), cos(mu(3)));
+
+    % trail tracks EKF estimate so it stays consistent with the grid
+    trail_x(end+1) = mu(1);
+    trail_y(end+1) = mu(2);
+
+    F = eye(size(P,1));
+    F(1,3) = -vn * sin(mu(3)) * DT;
+    F(2,3) =  vn * cos(mu(3)) * DT;
+
+    Q_mat = zeros(size(P,1));
+    Q_mat(1,1) = (Q_SIG_V * DT)^2;
+    Q_mat(2,2) = (Q_SIG_V * DT)^2;
+    Q_mat(3,3) = (Q_SIG_W * DT)^2;
+
+    P = F * P * F' + Q_mat;
+
+    % ── 3. LIDAR SCAN + EKF UPDATE ───────────────────────────────────────
+    R_mat = diag([R_RANGE^2, R_BEARING^2]);
+
+    for b = 1:LIDAR_NBEAMS
+        abs_angle  = mu(3) + beam_angles(b);
+
+        % ray cast
+        rc_hit = LIDAR_RANGE;
+        dx_ray = cos(abs_angle);  dy_ray = sin(abs_angle);
+        for wi = 1:size(WALLS,1)
+            x1=WALLS(wi,1); y1=WALLS(wi,2); x2=WALLS(wi,3); y2=WALLS(wi,4);
+            dxw=x2-x1; dyw=y2-y1;
+            denom = dx_ray*dyw - dy_ray*dxw;
+            if abs(denom)<1e-9, continue; end
+            tt = ((x1-mu(1))*dyw - (y1-mu(2))*dxw) / denom;
+            uu = ((x1-mu(1))*dy_ray - (y1-mu(2))*dx_ray) / denom;
+            if tt>0.01 && tt<rc_hit && uu>=0 && uu<=1
+                rc_hit = tt;
+            end
+        end
+        true_range = rc_hit;
+
+        if true_range >= LIDAR_RANGE * 0.98, continue; end
+
+        z_range   = true_range   + LIDAR_NOISE * randn;
+        z_bearing = beam_angles(b) + R_BEARING  * randn;
+
+        lx_meas = mu(1) + z_range * cos(mu(3) + z_bearing);
+        ly_meas = mu(2) + z_range * sin(mu(3) + z_bearing);
+
+        best_mah = ASSOC_TH;
+        best_k   = -1;
+
+        for k = 1:n_lm
+            idx_x = 3 + 2*(k-1) + 1;
+            idx_y = 3 + 2*(k-1) + 2;
+            dx_lm = mu(idx_x) - mu(1);
+            dy_lm = mu(idx_y) - mu(2);
+            pred_r = sqrt(dx_lm^2 + dy_lm^2);
+            pred_b = atan2(sin(atan2(dy_lm,dx_lm)-mu(3)), cos(atan2(dy_lm,dx_lm)-mu(3)));
+
+            innov = [z_range - pred_r;
+                     atan2(sin(z_bearing-pred_b), cos(z_bearing-pred_b))];
+
+            H = zeros(2, size(P,1));
+            H(1,1)=    -dx_lm/pred_r;  H(1,2)=    -dy_lm/pred_r;
+            H(1,idx_x)= dx_lm/pred_r;  H(1,idx_y)= dy_lm/pred_r;
+            H(2,1)=  dy_lm/pred_r^2;   H(2,2)= -dx_lm/pred_r^2;
+            H(2,3)= -1;
+            H(2,idx_x)= -dy_lm/pred_r^2;
+            H(2,idx_y)=  dx_lm/pred_r^2;
+
+            S   = H * P * H' + R_mat;
+            mah = innov' / S * innov;
+            if mah < best_mah
+                best_mah = mah;
+                best_k   = k;
+            end
+        end
+
+        if best_k == -1
+            if n_lm >= MAX_LM, continue; end
+            n_lm      = n_lm + 1;
+            mu(end+1) = lx_meas; %#ok<AGROW>
+            mu(end+1) = ly_meas; 
+            ns = length(mu);
+            P_new = zeros(ns);
+            P_new(1:ns-2,1:ns-2) = P;
+            P_new(ns-1,ns-1) = (R_RANGE*3)^2;
+            P_new(ns,  ns  ) = (R_RANGE*3)^2;
+            P = P_new;
+        else
+            idx_x = 3 + 2*(best_k-1) + 1;
+            idx_y = 3 + 2*(best_k-1) + 2;
+            dx_lm = mu(idx_x) - mu(1);
+            dy_lm = mu(idx_y) - mu(2);
+            pred_r = sqrt(dx_lm^2 + dy_lm^2);
+            pred_b = atan2(sin(atan2(dy_lm,dx_lm)-mu(3)), cos(atan2(dy_lm,dx_lm)-mu(3)));
+
+            innov = [z_range - pred_r;
+                     atan2(sin(z_bearing-pred_b), cos(z_bearing-pred_b))];
+
+            H = zeros(2, size(P,1));
+            H(1,1)=    -dx_lm/pred_r;  H(1,2)=    -dy_lm/pred_r;
+            H(1,idx_x)= dx_lm/pred_r;  H(1,idx_y)= dy_lm/pred_r;
+            H(2,1)=  dy_lm/pred_r^2;   H(2,2)= -dx_lm/pred_r^2;
+            H(2,3)= -1;
+            H(2,idx_x)= -dy_lm/pred_r^2;
+            H(2,idx_y)=  dx_lm/pred_r^2;
+
+            S  = H * P * H' + R_mat;
+            K  = P * H' / S;
+            mu = mu + K * innov;
+            mu(3) = atan2(sin(mu(3)), cos(mu(3)));
+            P  = (eye(size(P,1)) - K*H) * P;
+        end
+    end
+
+    % ── 4. OCCUPANCY GRID UPDATE ─────────────────────────────────────────
+    % world → grid for robot position
+    rob_c  = floor((mu(1) - GRID_ORIGIN(1)) / GRID_RES) + 1;
+    rob_r  = NR_grid - floor((mu(2) - GRID_ORIGIN(2)) / GRID_RES);
+    rob_r  = max(1, min(NR_grid, rob_r));
+    rob_c  = max(1, min(NC_grid, rob_c));
+
+    for b = 1:LIDAR_NBEAMS
+        abs_angle = mu(3) + beam_angles(b);
+
+        % ray cast (reuse inline)
+        rc_hit2 = LIDAR_RANGE;
+        dx_ray = cos(abs_angle);  dy_ray = sin(abs_angle);
+        for wi = 1:size(WALLS,1)
+            x1=WALLS(wi,1); y1=WALLS(wi,2); x2=WALLS(wi,3); y2=WALLS(wi,4);
+            dxw=x2-x1; dyw=y2-y1;
+            denom = dx_ray*dyw - dy_ray*dxw;
+            if abs(denom)<1e-9, continue; end
+            tt = ((x1-mu(1))*dyw - (y1-mu(2))*dxw) / denom;
+            uu = ((x1-mu(1))*dy_ray - (y1-mu(2))*dx_ray) / denom;
+            if tt>0.01 && tt<rc_hit2 && uu>=0 && uu<=1
+                rc_hit2 = tt;
+            end
+        end
+        true_range2 = rc_hit2;
+
+        hit_wall = (true_range2 < LIDAR_RANGE * 0.98);
+        scan_r   = max(0, min(true_range2 + LIDAR_NOISE*randn, LIDAR_RANGE));
+
+        end_x = mu(1) + scan_r * cos(abs_angle);
+        end_y = mu(2) + scan_r * sin(abs_angle);
+
+        % world → grid for beam endpoint
+        end_c = floor((end_x - GRID_ORIGIN(1)) / GRID_RES) + 1;
+        end_r = NR_grid - floor((end_y - GRID_ORIGIN(2)) / GRID_RES);
+        end_r = max(1, min(NR_grid, end_r));
+        end_c = max(1, min(NC_grid, end_c));
+
+        % Bresenham ray trace (inlined)
+        br1=rob_r; bc1=rob_c; br2=end_r; bc2=end_c;
+        bdr=abs(br2-br1); bdc=abs(bc2-bc1);
+        bsr=sign(br2-br1); bsc=sign(bc2-bc1);
+        berr=bdr-bdc;
+        br=br1; bc=bc1;
+        while true
+            % free cells (everything except final endpoint)
+            if ~(br==br2 && bc==bc2)
+                if br>=1&&br<=NR_grid&&bc>=1&&bc<=NC_grid
+                    log_odds(br,bc) = max(LO_MIN, log_odds(br,bc) + LO_FREE);
+                end
+            end
+            if br==br2 && bc==bc2, break; end
+            be2=2*berr;
+            if be2 > -bdc, berr=berr-bdc; br=br+bsr; end
+            if be2 <  bdr, berr=berr+bdr; bc=bc+bsc; end
+        end
+
+        % mark endpoint occupied
+        if hit_wall
+            if end_r>=1&&end_r<=NR_grid&&end_c>=1&&end_c<=NC_grid
+                log_odds(end_r,end_c) = min(LO_MAX, log_odds(end_r,end_c) + LO_OCC);
+            end
+        end
+    end
+
+    % ── 5. FRONTIER SELECTION ─────────────────────────────────────────────
+    recompute_frontiers = (mod(step, FRONTIER_INTERVAL) == 0);
+
+    if ~isempty(target_world)
+        dist_to_goal = norm([mu(1), mu(2)] - target_world);
+        if dist_to_goal < GOAL_THRESH
+            recompute_frontiers = true;
+            target_world  = [];
+            current_path  = [];
+        end
+        if dist_to_goal >= last_dist_to_goal - 0.01
+            steps_no_prog = steps_no_prog + 1;
+        else
+            steps_no_prog = 0;
+        end
+        last_dist_to_goal = dist_to_goal;
+        if steps_no_prog >= STUCK_LIMIT
+            recompute_frontiers = true;
+            steps_no_prog = 0;
+            current_path  = [];
+            % blacklist the failed target so we don't revisit it immediately
+            if ~isempty(target_world)
+                bl_c = floor((target_world(1)-GRID_ORIGIN(1))/GRID_RES)+1;
+                bl_r = NR_grid - floor((target_world(2)-GRID_ORIGIN(2))/GRID_RES);
+                bl_r = max(1,min(NR_grid,bl_r)); bl_c = max(1,min(NC_grid,bl_c));
+                frontier_blacklist(end+1,:) = [bl_r, bl_c, step + BLACKLIST_TTL];
+            end
+        end
+    else
+        recompute_frontiers = true;
+    end
+
+    if recompute_frontiers
+        frontiers = frontier_detector(log_odds, GRID_RES, GRID_ORIGIN);
+
+        keep = arrayfun(@(f) f.size >= MIN_FRONTIER_SIZE, frontiers);
+        frontiers = frontiers(keep);
+
+        if isempty(frontiers)
+            exploration_done = true;
+            stop_reason = 'All frontiers explored — map complete!';
+            break;
+        end
+
+        % expire old blacklist entries
+        if ~isempty(frontier_blacklist)
+            frontier_blacklist = frontier_blacklist(frontier_blacklist(:,3) > step, :);
+        end
+
+        % hybrid score: size / distance  (blacklisted centroids score 0)
+        scores = zeros(1, numel(frontiers));
+        for fi = 1:numel(frontiers)
+            % check blacklist: centroid grid cell within BLACKLIST_RADIUS?
+            fc_c = floor((frontiers(fi).centroid_w(1)-GRID_ORIGIN(1))/GRID_RES)+1;
+            fc_r = NR_grid - floor((frontiers(fi).centroid_w(2)-GRID_ORIGIN(2))/GRID_RES);
+            is_blacklisted = false;
+            for bli = 1:size(frontier_blacklist,1)
+                if abs(fc_r - frontier_blacklist(bli,1)) <= BLACKLIST_RADIUS && ...
+                   abs(fc_c - frontier_blacklist(bli,2)) <= BLACKLIST_RADIUS
+                    is_blacklisted = true;
+                    break;
+                end
+            end
+            if is_blacklisted, continue; end  % score stays 0
+
+            dist_f  = norm([mu(1), mu(2)] - frontiers(fi).centroid_w);
+            dist_f  = max(dist_f, SCORE_DIST_MIN);
+            scores(fi) = frontiers(fi).size / dist_f;
+        end
+
+        % if all frontiers are blacklisted, clear the blacklist and retry
+        if max(scores) == 0
+            frontier_blacklist = zeros(0,3);
+            for fi = 1:numel(frontiers)
+                dist_f  = norm([mu(1), mu(2)] - frontiers(fi).centroid_w);
+                dist_f  = max(dist_f, SCORE_DIST_MIN);
+                scores(fi) = frontiers(fi).size / dist_f;
+            end
+        end
+
+        [~, best_fi]  = max(scores);
+        target_world  = frontiers(best_fi).centroid_w;
+
+        % build inflated obstacle grid
+        occ_grid = imdilate(log_odds > OCC_TH, strel('disk', INFLATE_R));
+
+        % world → grid for start and goal
+        s_c = floor((mu(1)-GRID_ORIGIN(1))/GRID_RES)+1;
+        s_r = NR_grid - floor((mu(2)-GRID_ORIGIN(2))/GRID_RES);
+        s_r = max(1,min(NR_grid,s_r)); s_c = max(1,min(NC_grid,s_c));
+
+        g_c = floor((target_world(1)-GRID_ORIGIN(1))/GRID_RES)+1;
+        g_r = NR_grid - floor((target_world(2)-GRID_ORIGIN(2))/GRID_RES);
+        g_r = max(1,min(NR_grid,g_r)); g_c = max(1,min(NC_grid,g_c));
+
+        path_rc = astar_planner(occ_grid, [s_r s_c], [g_r g_c]);
+
+        if isempty(path_rc)
+            [~, sort_idx] = sort(scores, 'descend');
+            found = false;
+            for fi2 = 2:min(5, numel(sort_idx))
+                target_world = frontiers(sort_idx(fi2)).centroid_w;
+                g_c2 = floor((target_world(1)-GRID_ORIGIN(1))/GRID_RES)+1;
+                g_r2 = NR_grid - floor((target_world(2)-GRID_ORIGIN(2))/GRID_RES);
+                g_r2 = max(1,min(NR_grid,g_r2)); g_c2 = max(1,min(NC_grid,g_c2));
+                path_rc = astar_planner(occ_grid, [s_r s_c], [g_r2 g_c2]);
+                if ~isempty(path_rc), found=true; break; end
+            end
+            if ~found
+                current_path = [];
+                target_world = [];
+            end
+        end
+
+        if ~isempty(path_rc)
+            % grid path → world coords
+            current_path = zeros(size(path_rc,1), 2);
+            for pi2 = 1:size(path_rc,1)
+                pr = path_rc(pi2,1);  pc = path_rc(pi2,2);
+                current_path(pi2,1) = GRID_ORIGIN(1) + (pc - 0.5)*GRID_RES;
+                current_path(pi2,2) = GRID_ORIGIN(2) + (NR_grid - pr + 0.5)*GRID_RES;
+            end
+            path_step_idx     = 1;
+            last_dist_to_goal = norm([mu(1),mu(2)] - target_world);
+            steps_no_prog     = 0;
+        end
+    end
+
+    % periodic path validity check
+    if mod(step, REPLAN_EVERY)==0 && ~isempty(current_path) && ~isempty(target_world)
+        occ_grid     = imdilate(log_odds > OCC_TH, strel('disk', INFLATE_R));
+        rem_path     = current_path(path_step_idx:end, :);
+        path_blocked = false;
+        for pi2 = 1:size(rem_path,1)
+            rc_c = floor((rem_path(pi2,1)-GRID_ORIGIN(1))/GRID_RES)+1;
+            rc_r = NR_grid - floor((rem_path(pi2,2)-GRID_ORIGIN(2))/GRID_RES);
+            rc_r = max(1,min(NR_grid,rc_r)); rc_c = max(1,min(NC_grid,rc_c));
+            if occ_grid(rc_r, rc_c), path_blocked=true; break; end
+        end
+        if path_blocked
+            s_c = floor((mu(1)-GRID_ORIGIN(1))/GRID_RES)+1;
+            s_r = NR_grid - floor((mu(2)-GRID_ORIGIN(2))/GRID_RES);
+            s_r = max(1,min(NR_grid,s_r)); s_c = max(1,min(NC_grid,s_c));
+            g_c = floor((target_world(1)-GRID_ORIGIN(1))/GRID_RES)+1;
+            g_r = NR_grid - floor((target_world(2)-GRID_ORIGIN(2))/GRID_RES);
+            g_r = max(1,min(NR_grid,g_r)); g_c = max(1,min(NC_grid,g_c));
+            new_path_rc = astar_planner(occ_grid, [s_r s_c], [g_r g_c]);
+            if ~isempty(new_path_rc)
+                current_path = zeros(size(new_path_rc,1), 2);
+                for pi2 = 1:size(new_path_rc,1)
+                    pr = new_path_rc(pi2,1);  pc = new_path_rc(pi2,2);
+                    current_path(pi2,1) = GRID_ORIGIN(1) + (pc-0.5)*GRID_RES;
+                    current_path(pi2,2) = GRID_ORIGIN(2) + (NR_grid-pr+0.5)*GRID_RES;
+                end
+                path_step_idx = 1;
+            end
+        end
+    end
+
+    % ── 6. VISUALISATION ─────────────────────────────────────────────────
+    if mod(step, VIS_EVERY) == 0
+        disp_grid = max(-1, min(1, log_odds / LO_MAX));
+        set(h_grid,  'CData', flipud(disp_grid));
+        set(h_trail, 'XData', trail_x, 'YData', trail_y);
+        set(h_robot, 'XData', mu(1),   'YData', mu(2));
+
+        if ~isempty(current_path)
+            rp = current_path(path_step_idx:end, :);
+            set(h_path, 'XData', rp(:,1), 'YData', rp(:,2));
+        else
+            set(h_path, 'XData', NaN, 'YData', NaN);
+        end
+
+        if ~isempty(frontiers)
+            fc = vertcat(frontiers.centroid_w);
+            set(h_fronts, 'XData', fc(:,1), 'YData', fc(:,2));
+        else
+            set(h_fronts, 'XData', NaN, 'YData', NaN);
+        end
+
+        if ~isempty(target_world)
+            set(h_target, 'XData', target_world(1), 'YData', target_world(2));
+        else
+            set(h_target, 'XData', NaN, 'YData', NaN);
+        end
+
+        known_cells = sum(abs(log_odds(:)) > 0.1);
+        cov_pct     = 100 * known_cells / (NR_grid * NC_grid);
+        set(h_cov,  'String', sprintf('Coverage: %.1f%%', cov_pct));
+        set(h_step, 'String', sprintf('Step: %d / %d', step, MAX_STEPS));
+        title(ax, sprintf('Frontier Exploration  |  step %d  |  landmarks: %d  |  coverage: %.1f%%', ...
+              step, n_lm, cov_pct), 'Color', 'w', 'FontSize', 10);
+
+        drawnow limitrate;
+
+        if GIF_ENABLED && mod(step, GIF_EVERY) == 0
+            save_exploration_gif(fig, GIF_FILE, GIF_DELAY, gif_frame_idx);
+            gif_frame_idx = gif_frame_idx + 1;
+        end
+    end
+
+end  % main loop
+
+%% ── TERMINATION ──────────────────────────────────────────────────────────
+if ~exploration_done
+    stop_reason = sprintf('Step budget (%d steps) reached.', MAX_STEPS);
+end
+
+known_cells = sum(abs(log_odds(:)) > 0.1);
+cov_pct     = 100 * known_cells / (NR_grid * NC_grid);
+
+disp_grid = max(-1, min(1, log_odds / LO_MAX));
+set(h_grid,   'CData', flipud(disp_grid));
+set(h_trail,  'XData', trail_x, 'YData', trail_y);
+set(h_robot,  'XData', mu(1), 'YData', mu(2));
+set(h_fronts, 'XData', NaN, 'YData', NaN);
+set(h_target, 'XData', NaN, 'YData', NaN);
+set(h_path,   'XData', NaN, 'YData', NaN);
+title(ax, sprintf('Done! %s  |  Final coverage: %.1f%%', stop_reason, cov_pct), ...
+      'Color', [0.4 1 0.4], 'FontSize', 10);
+drawnow;
+
+if GIF_ENABLED
+    save_exploration_gif(fig, GIF_FILE, 1.5, gif_frame_idx);
+end
+
+fprintf('\n=== Module 08 Complete ===\n');
+fprintf('Stop reason : %s\n', stop_reason);
+fprintf('Steps run   : %d\n', step);
+fprintf('Landmarks   : %d\n', n_lm);
+fprintf('Coverage    : %.1f%%\n', cov_pct);
+fprintf('GIF saved   : %s\n', GIF_FILE);
