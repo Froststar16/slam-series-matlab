@@ -24,8 +24,8 @@ Each module stands alone and runs independently. The later ones reuse pieces fro
 ## Results
 
 ### EKF SLAM — mapping and metrics
-![EKF SLAM map](results_media/ekf_slam_map.png)
-![EKF SLAM metrics](results_media/ekf_slam_metrics.png)
+![EKF SLAM map](results_media/ekf_slam_map.gif)
+![EKF SLAM metrics](results_media/ekf_slam_metrics.gif)
 
 ### A* Navigation
 ![A* navigation](results_media/nav_astar.gif)
