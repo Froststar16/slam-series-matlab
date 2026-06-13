@@ -50,7 +50,7 @@ The one where I stopped clicking goals entirely. The robot looks at its occupanc
 
 It finished the maze at **88.2% coverage in 5475 steps** — well under a quarter of the step budget — and stopped cleanly because the remaining ~12% genuinely has no reachable entrance. No human input from start to finish.
 
-![Frontier Exploration](results_media/frontier_exploration.png)
+![Frontier Exploration](results_media/exploration.gif)
 
 ### 09 — Pose Graph SLAM (from-scratch Gauss-Newton)
 Module 02 detects loop closures and folds a correction into the EKF on the spot. This module asks a bigger question: what if you collected *every* odometry step and *every* loop closure as edges in one big graph, and optimized the whole trajectory (and the whole landmark map) at once? That's a pose graph, and solving it is what real SLAM back ends — Cartographer, ORB-SLAM, the lot — actually do.
@@ -61,13 +61,9 @@ I built the Gauss-Newton solver completely from scratch. Every pose `(x, y, thet
 
 On a synthetic 8m square loop where the odometry has a small systematic bias (so the loop never quite closes on its own), the solver converges in **5 iterations**: chi2 drops from 133,474 to 1,314, and trajectory drift drops from **1.33m to 0.076m ATE** — a 17x reduction.
 
-![Before and after optimization](results_media/before_optimization.png)
-![After optimization](results_media/after_optimization.png)
-
 I also wanted to know *where* that improvement was coming from. Re-running the same solver on just the pose-only sub-graph — odometry plus the single loop closure, no landmarks at all — only gets to 0.41m ATE. So in this graph, the 668 landmark observations are doing most of the heavy lifting, not the one loop closure on its own.
 
 ![Full graph vs pose-only comparison](results_media/full_vs_pose_only_comparison.png)
-![Chi-squared convergence](results_media/chi2_convergence.png)
 
 ---
 

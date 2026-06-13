@@ -78,26 +78,26 @@ it is what corrects drift.
 ground-truth square, and estimated landmark positions (orange) are offset
 from their true positions (black X):
 
-![Before optimization](results_media/before_optimization.png)
+![Before optimization](../results_media/before_optimization.png)
 
 **After optimization** — the full pose+landmark graph snaps the trajectory
 back onto the ground-truth loop, and landmark estimates land almost exactly
 on their true positions:
 
-![After optimization](results_media/after_optimization.png)
+![After optimization](../results_media/after_optimization.png)
 
 **Convergence** — chi2 drops from 133,474 to 1,314 in 5 iterations:
 
-![Chi-squared convergence](results_media/chi2_convergence.png)
+![Chi-squared convergence](../results_media/chi2_convergence.png)
 
 **Animated convergence** — watch the drift get corrected iteration by
 iteration:
 
-![Pose graph convergence animation](results_media/pose_graph_convergence.gif)
+![Pose graph convergence animation](../results_media/pose_graph_convergence.gif)
 
 **Full graph vs pose-only sub-graph** — landmarks vs. a single loop closure:
 
-![Full graph vs pose-only comparison](results_media/full_vs_pose_only_comparison.png)
+![Full graph vs pose-only comparison](../results_media/full_vs_pose_only_comparison.png)
 
 ## Files
 
