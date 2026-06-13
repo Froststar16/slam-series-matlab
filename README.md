@@ -1,8 +1,8 @@
-# 2D LiDAR SLAM — From a Kalman Filter to a Robot That Explores (and Optimizes) on Its Own
+# 2D LiDAR SLAM — From a Kalman Filter to a Benchmark That Picks a Winner
 
 ![EKF SLAM](results_media/ekf_slam_map.gif)
 
-I built this project to actually understand how robots figure out where they are while simultaneously building a map of their surroundings — the classic SLAM problem. Started from scratch in MATLAB with a basic Extended Kalman Filter, ended up with a live ROS 2 pipeline, A* navigation, a full autonomous patrol loop, a robot that maps an entire unknown environment with zero human input, and a from-scratch nonlinear optimizer that corrects its own trajectory drift after the fact. Here's how it went.
+I built this project to actually understand how robots figure out where they are while simultaneously building a map of their surroundings — the classic SLAM problem. Started from scratch in MATLAB with a basic Extended Kalman Filter, ended up with a live ROS 2 pipeline, A* navigation, a full autonomous patrol loop, a robot that maps an entire unknown environment with zero human input, a from-scratch nonlinear optimizer that corrects its own trajectory drift, and finally a head-to-head benchmark that runs every major method on the same problem and explains, with numbers, why the winner wins. Here's how it went.
 
 ---
 
@@ -10,7 +10,7 @@ I built this project to actually understand how robots figure out where they are
 
 I kept watching Brian Douglas's Autonomous Navigation series and wanted to go beyond just following along. So I decided to implement each algorithm myself, debug it, break it, fix it, and only move to the next one once I genuinely understood what was happening under the hood.
 
-Nine modules later, here we are.
+Ten modules later, here we are.
 
 ---
 
@@ -61,9 +61,30 @@ I built the Gauss-Newton solver completely from scratch. Every pose `(x, y, thet
 
 On a synthetic 8m square loop where the odometry has a small systematic bias (so the loop never quite closes on its own), the solver converges in **5 iterations**: chi2 drops from 133,474 to 1,314, and trajectory drift drops from **1.33m to 0.076m ATE** — a 17x reduction.
 
+
 I also wanted to know *where* that improvement was coming from. Re-running the same solver on just the pose-only sub-graph — odometry plus the single loop closure, no landmarks at all — only gets to 0.41m ATE. So in this graph, the 668 landmark observations are doing most of the heavy lifting, not the one loop closure on its own.
 
-![Full graph vs pose-only comparison](results_media/full_vs_pose_only_comparison.png)
+
+### 10 — Benchmark Capstone
+Every module above was its own demo, with its own data and its own story. This one asks the question that ties them all together: run EKF SLAM (01), EKF + Loop Closure (02), FastSLAM (03), and Pose Graph SLAM (09) on the **exact same problem** — a figure-eight trajectory with 4 loop closures — and see what actually wins, by how much, and why.
+
+![Trajectory comparison](results_media/trajectory_comparison.png)
+
+The headline progression: **1.860m → 0.328m → 0.101m ATE** (EKF → EKF+LC → Pose Graph). Loop closure re-association alone is a 5.7x improvement; the pose graph is another 3.2x on top of that, for 18.4x total — using 1.572s of compute.
+
+![ATE comparison](results_media/ate_comparison.png)
+
+The most interesting single result, though, is that **EKF+LC's RPE gets *worse*** even as its ATE gets dramatically better (0.070m → 0.134m). ATE measures global position error; RPE measures local smoothness over short windows. EKF+LC corrects drift with a single *snap* at the revisit point — great globally, but that snap is itself a large local discontinuity. The pose graph wins on *both* metrics because its correction is spread smoothly across all 424 poses by the joint optimization — no snap, just a gentle redistribution.
+
+![RPE comparison](results_media/rpe_comparison.png)
+![Runtime comparison](results_media/runtime_comparison.png)
+
+FastSLAM (50 particles) came in with the *worst* ATE of the four (2.809m) and was 67x slower than plain EKF. I ran a sweep to 200 particles to check whether it was just under-resourced:
+
+![FastSLAM particle sweep](results_media/fastslam_particle_sweep.png)
+![FastSLAM sweep trajectories](results_media/fastslam_sweep_trajectories.png)
+
+4x the particles improved ATE somewhat (2.809m → 1.762m) but made RPE *worse* (0.054m → 0.086m) and the landmark count barely moved (61 → 62), for **7.3x the runtime**. If more particles were fixing the re-association problem, the landmark count would drop toward the true 32. It doesn't — more particles just means more chances that one particle's drift happens to line up, at exponential cost. That's the textbook FastSLAM 1.0 proposal-distribution limitation, confirmed on my own data.
 
 ---
 
@@ -80,6 +101,7 @@ I also wanted to know *where* that improvement was coming from. Re-running the s
 | 07 | [Autonomous Navigation](07_autonomous_navigation/) | Pure pursuit + dynamic replan | Full patrol pipeline |
 | 08 | [Frontier Exploration](08_frontier_exploration/) | Frontier detection + hybrid scoring | Robot picks its own goals |
 | 09 | [Pose Graph SLAM](09_pose_graph_slam/) | From-scratch Gauss-Newton PGO | Backend that *uses* loop closures |
+| 10 | [Benchmark Capstone](10_benchmark_capstone/) | Same dataset, 4 methods, ATE/RPE/runtime | Which one wins, and why |
 
 ---
 
@@ -95,9 +117,12 @@ EKF SLAM (01)
                  │    └─ Autonomous patrol (07)   ← full loop, clicked goals
                  │         └─ Frontier exploration (08) ← robot picks its own goals
                  └─ Pose graph SLAM (09) ← finally *uses* the loop closures from 02
+
+01 + 02 + 03 + 09 ──────────────────────────────────────────────► Benchmark Capstone (10)
+                     same dataset, same metrics, one winner
 ```
 
-Module 08 quietly drops the EKF landmark tracking that powers 01–07 — more on that below. Module 09 picks it back up: the landmarks from 01/03 and the loop closures from 02 finally become inputs to an actual optimization problem, instead of just being detected and patched in real time.
+Module 08 quietly drops the EKF landmark tracking that powers 01–07 — more on that below. Module 09 picks it back up: the landmarks from 01/03 and the loop closures from 02 finally become inputs to an actual optimization problem, instead of just being detected and patched in real time. Module 10 closes the loop on the whole series: 01, 02, 03, and 09 all run on one shared dataset, so the comparisons in the table below aren't anecdotal — they're measured.
 
 ---
 
@@ -129,6 +154,11 @@ pose_graph_slam_main
 % → watch the convergence animation, then optionally:
 test_pgo_toy_graph
 % → standalone ground-truth recovery check, no toolbox needed
+
+% Module 10 — Benchmark Capstone (fully autonomous, no input)
+cd ../10_benchmark_capstone
+benchmark_main
+% → ~1.5-2 min total, the 200-particle FastSLAM sweep is the slow part
 ```
 
 ```bash
@@ -168,6 +198,11 @@ cd 05_ros2_integration
 - Pose graphs have a **gauge freedom** — the whole graph can be rigidly rotated/translated without changing any edge error, which makes `H` singular unless something is pinned down. Anchoring pose 1 with a large prior on the diagonal of `H` fixes this with one line, but skipping it gives a solver that "converges" to nonsense.
 - MATLAB's `optimizePoseGraph` (Navigation Toolbox) turned out not to be available on this install, and it only handles pose-pose edges anyway — no concept of landmark nodes. Rather than depend on it, I wrote a standalone **ground-truth recovery test**: a tiny noise-free graph where every edge is exactly consistent with a known answer, so the true optimum has chi2 = 0. The solver recovered it to chi2 ≈ 1e-26 and position errors ≈ 1e-15 — basically machine precision, and a toolbox-independent way to prove the Jacobians are *exactly* right, not just close enough.
 
+**Benchmark capstone (Module 10):**
+- Building one shared dataset that EKF SLAM, EKF+LC, FastSLAM, and the pose graph all consume identically was more work than any single algorithm, but it's the difference between "I think the pose graph is better" and "the pose graph is 18.4x better than plain EKF on the identical problem, here's the table."
+- ATE and RPE can disagree, and when they do it's informative rather than a bug: EKF+LC improved ATE by 5.7x but made RPE *worse* — a single drift-correcting "snap" is great for global accuracy and bad for local smoothness. The pose graph wins both because its correction is spread across the whole trajectory instead of happening at one instant.
+- The FastSLAM particle sweep (50 → 200) was the most informative negative result in the project: ATE improved a little, RPE got worse, the landmark count barely moved, and runtime went up 7.3x. That combination — not "it's slow" alone — is what actually demonstrates the FastSLAM 1.0 proposal-distribution problem rather than just an under-tuned parameter.
+
 ---
 
 ## Requirements
@@ -175,7 +210,7 @@ cd 05_ros2_integration
 - MATLAB R2024a, Image Processing Toolbox, Robotics System Toolbox, Navigation Toolbox, Computer Vision Toolbox, Sensor Fusion and Tracking Toolbox
 - Python 3.10+, numpy, scipy (Module 05)
 - ROS 2 Humble, RViz2 (Module 05)
-- Note: Module 09's from-scratch optimizer has no toolbox dependencies at all. Navigation Toolbox is only used for an optional sanity-check comparison, and the module degrades gracefully (with a console message) if it isn't available.
+- Note: Module 09's from-scratch optimizer has no toolbox dependencies at all. Navigation Toolbox is only used for an optional sanity-check comparison, and the module degrades gracefully (with a console message) if it isn't available. Module 10 reuses Module 09's optimizer and has the same lack of dependency.
 
 ---
 
@@ -187,3 +222,4 @@ cd 05_ros2_integration
 4. Brian Douglas — Autonomous Navigation series (YouTube / MATLAB)
 5. Yamauchi — "A Frontier-Based Approach for Autonomous Exploration" (1997)
 6. Grisetti, Kummerle, Stachniss, Burgard — "A Tutorial on Graph-Based SLAM" (2010)
+7. Sturm et al. — "A Benchmark for the Evaluation of RGB-D SLAM Systems" (2012) — ATE/RPE definitions used in Module 10
