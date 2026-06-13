@@ -1,8 +1,8 @@
-# 2D LiDAR SLAM — From a Kalman Filter to a Robot That Explores on Its Own
+# 2D LiDAR SLAM — From a Kalman Filter to a Robot That Explores (and Optimizes) on Its Own
 
 ![EKF SLAM](results_media/ekf_slam_map.gif)
 
-I built this project to actually understand how robots figure out where they are while simultaneously building a map of their surroundings — the classic SLAM problem. Started from scratch in MATLAB with a basic Extended Kalman Filter, ended up with a live ROS 2 pipeline, A* navigation, a full autonomous patrol loop, and finally a robot that maps an entire unknown environment with zero human input. Here's how it went.
+I built this project to actually understand how robots figure out where they are while simultaneously building a map of their surroundings — the classic SLAM problem. Started from scratch in MATLAB with a basic Extended Kalman Filter, ended up with a live ROS 2 pipeline, A* navigation, a full autonomous patrol loop, a robot that maps an entire unknown environment with zero human input, and a from-scratch nonlinear optimizer that corrects its own trajectory drift after the fact. Here's how it went.
 
 ---
 
@@ -10,7 +10,7 @@ I built this project to actually understand how robots figure out where they are
 
 I kept watching Brian Douglas's Autonomous Navigation series and wanted to go beyond just following along. So I decided to implement each algorithm myself, debug it, break it, fix it, and only move to the next one once I genuinely understood what was happening under the hood.
 
-Eight modules later, here we are.
+Nine modules later, here we are.
 
 ---
 
@@ -52,6 +52,23 @@ It finished the maze at **88.2% coverage in 5475 steps** — well under a quarte
 
 ![Frontier Exploration](results_media/frontier_exploration.png)
 
+### 09 — Pose Graph SLAM (from-scratch Gauss-Newton)
+Module 02 detects loop closures and folds a correction into the EKF on the spot. This module asks a bigger question: what if you collected *every* odometry step and *every* loop closure as edges in one big graph, and optimized the whole trajectory (and the whole landmark map) at once? That's a pose graph, and solving it is what real SLAM back ends — Cartographer, ORB-SLAM, the lot — actually do.
+
+I built the Gauss-Newton solver completely from scratch. Every pose `(x, y, theta)` and every landmark `(x, y)` is a variable in one state vector — 675 of them for a 212-pose, 18-landmark graph. Each edge type (odometry, loop closure, landmark observation) gets its own analytically-derived error function and Jacobian, assembled every iteration into a sparse information matrix `H` and gradient `b`, solving `H·dx = -b`.
+
+![Pose graph convergence](results_media/pose_graph_convergence.gif)
+
+On a synthetic 8m square loop where the odometry has a small systematic bias (so the loop never quite closes on its own), the solver converges in **5 iterations**: chi2 drops from 133,474 to 1,314, and trajectory drift drops from **1.33m to 0.076m ATE** — a 17x reduction.
+
+![Before and after optimization](results_media/before_optimization.png)
+![After optimization](results_media/after_optimization.png)
+
+I also wanted to know *where* that improvement was coming from. Re-running the same solver on just the pose-only sub-graph — odometry plus the single loop closure, no landmarks at all — only gets to 0.41m ATE. So in this graph, the 668 landmark observations are doing most of the heavy lifting, not the one loop closure on its own.
+
+![Full graph vs pose-only comparison](results_media/full_vs_pose_only_comparison.png)
+![Chi-squared convergence](results_media/chi2_convergence.png)
+
 ---
 
 ## Modules at a glance
@@ -66,6 +83,7 @@ It finished the maze at **88.2% coverage in 5475 steps** — well under a quarte
 | 06 | [A* Navigation](06_astar_navigation/) | A* + path smoothing | Click-to-navigate on SLAM map |
 | 07 | [Autonomous Navigation](07_autonomous_navigation/) | Pure pursuit + dynamic replan | Full patrol pipeline |
 | 08 | [Frontier Exploration](08_frontier_exploration/) | Frontier detection + hybrid scoring | Robot picks its own goals |
+| 09 | [Pose Graph SLAM](09_pose_graph_slam/) | From-scratch Gauss-Newton PGO | Backend that *uses* loop closures |
 
 ---
 
@@ -77,12 +95,13 @@ EKF SLAM (01)
        └─ FastSLAM (03)             ← better with many landmarks
             └─ Occupancy grid (04)  ← dense map for navigation
                  ├─ ROS 2 (05)      ← real sensors + RViz2
-                 └─ A* (06)         ← click a goal, watch it go
-                      └─ Autonomous patrol (07)   ← full loop, clicked goals
-                           └─ Frontier exploration (08) ← robot picks its own goals
+                 ├─ A* (06)         ← click a goal, watch it go
+                 │    └─ Autonomous patrol (07)   ← full loop, clicked goals
+                 │         └─ Frontier exploration (08) ← robot picks its own goals
+                 └─ Pose graph SLAM (09) ← finally *uses* the loop closures from 02
 ```
 
-Module 08 quietly drops the EKF landmark tracking that powers 01–07 — more on that below.
+Module 08 quietly drops the EKF landmark tracking that powers 01–07 — more on that below. Module 09 picks it back up: the landmarks from 01/03 and the loop closures from 02 finally become inputs to an actual optimization problem, instead of just being detected and patched in real time.
 
 ---
 
@@ -107,6 +126,13 @@ autonomous_nav_main
 cd ../08_frontier_exploration
 frontier_exploration_main
 % → just watch
+
+% Module 09 — Pose Graph SLAM (fully autonomous, no input)
+cd ../09_pose_graph_slam
+pose_graph_slam_main
+% → watch the convergence animation, then optionally:
+test_pgo_toy_graph
+% → standalone ground-truth recovery check, no toolbox needed
 ```
 
 ```bash
@@ -136,10 +162,15 @@ cd 05_ros2_integration
 - Pure pursuit with a short lookahead (0.4–0.45m) tracks corners much better than waypoint stepping — curvature-based speed scaling is key
 - Loose data association thresholds cause false loop closures that corrupt the entire map in seconds
 
-**Frontier exploration (the big one):**
+**Frontier exploration:**
 - EKF point-landmark SLAM and long straight walls do **not** mix. Every beam along a wall looks like a "new" landmark, the state vector explodes before the robot leaves the first room, and the O(landmarks) update loop grinds to a crawl. Module 08 dropped EKF landmarks entirely in favour of dead-reckoning + the occupancy grid — ~30x faster and the map stopped getting wall-smear artefacts as a bonus.
 - A robot that picks its own goals will eventually pick one that's unreachable, or drift its estimated position into a wall it thinks is free. Needed a stuck-counter, a blacklist with expiry, and a "spiral outward until you find a free cell" recovery before it stopped looping in place forever.
 - 88% coverage on a maze like this is actually close to the ceiling — the last bit of grey is rooms with no navigable entrance within the obstacle inflation radius. The robot correctly gave up rather than spinning forever looking for frontiers that don't exist.
+
+**Pose graph optimization (Module 09):**
+- The single most time-consuming bug was a transpose error in the gradient accumulation: `(J'*Omega*err)'` looks almost right but is dimensionally wrong when `err` is a row vector — needs to be `J'*Omega*err'` (transpose `err` to a column *first*). MATLAB's "Incorrect dimensions for matrix multiplication" error pointed straight at it, but it's an easy one to write without noticing.
+- Pose graphs have a **gauge freedom** — the whole graph can be rigidly rotated/translated without changing any edge error, which makes `H` singular unless something is pinned down. Anchoring pose 1 with a large prior on the diagonal of `H` fixes this with one line, but skipping it gives a solver that "converges" to nonsense.
+- MATLAB's `optimizePoseGraph` (Navigation Toolbox) turned out not to be available on this install, and it only handles pose-pose edges anyway — no concept of landmark nodes. Rather than depend on it, I wrote a standalone **ground-truth recovery test**: a tiny noise-free graph where every edge is exactly consistent with a known answer, so the true optimum has chi2 = 0. The solver recovered it to chi2 ≈ 1e-26 and position errors ≈ 1e-15 — basically machine precision, and a toolbox-independent way to prove the Jacobians are *exactly* right, not just close enough.
 
 ---
 
@@ -148,6 +179,7 @@ cd 05_ros2_integration
 - MATLAB R2024a, Image Processing Toolbox, Robotics System Toolbox, Navigation Toolbox, Computer Vision Toolbox, Sensor Fusion and Tracking Toolbox
 - Python 3.10+, numpy, scipy (Module 05)
 - ROS 2 Humble, RViz2 (Module 05)
+- Note: Module 09's from-scratch optimizer has no toolbox dependencies at all. Navigation Toolbox is only used for an optional sanity-check comparison, and the module degrades gracefully (with a console message) if it isn't available.
 
 ---
 
@@ -158,3 +190,4 @@ cd 05_ros2_integration
 3. Moravec & Elfes — "High Resolution Maps from Wide Angle Sonar" (1985)
 4. Brian Douglas — Autonomous Navigation series (YouTube / MATLAB)
 5. Yamauchi — "A Frontier-Based Approach for Autonomous Exploration" (1997)
+6. Grisetti, Kummerle, Stachniss, Burgard — "A Tutorial on Graph-Based SLAM" (2010)
